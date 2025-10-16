@@ -5,7 +5,7 @@ import os
 def check_predictions_file():
     #Constructing path to CSV file relative to script's location
     script_dir = os.path.dirname(os.path.realpath(__file__))
-    file_path = os.path.join(script_dir, "predictions_v4.csv")
+    file_path = os.path.join(script_dir, "predictions_improved.csv")
 
     try:
         df = pd.read_csv(file_path)
