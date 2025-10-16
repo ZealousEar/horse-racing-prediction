@@ -3,6 +3,7 @@
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+from sklearn.model_selection import GroupKFold
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -18,6 +19,9 @@ class RefinedCompliantModel:
         self.max_win_rate = 0.30  #Cap at 30% win rate
         self.smooth_factor = 20   #Stronger smoothing than V3's 10
         self.feature_weight = 0.5  #Reduce impact of specialization features
+        # Calibration parameters
+        self.temperature = 1.0
+        self.cv_folds = 5
         
     def validate_no_leakage(self, df, stage=""):
         """Ensure no forbidden columns are used"""
@@ -315,19 +319,7 @@ class RefinedCompliantModel:
         print(f"Model trained on {len(self.feature_cols)} features (including refined specialization)")
         
         #Training model with STRONGER regularization than V3
-        self.model = lgb.LGBMClassifier(
-            n_estimators=300,
-            learning_rate=0.025,  #Slightly lower
-            num_leaves=25,        #Fewer leaves
-            max_depth=5,          #Shallower
-            min_child_samples=30, #More samples required
-            subsample=0.7,        #More aggressive subsampling
-            colsample_bytree=0.7,
-            reg_alpha=0.2,        #Stronger L1
-            reg_lambda=0.2,       #Stronger L2
-            random_state=42,
-            verbose=-1
-        )
+        self.model = self._create_base_model()
         self.model.fit(X, y)
         
         #Showing feature importance
@@ -343,6 +335,14 @@ class RefinedCompliantModel:
         spec_features = importance[importance['feature'].str.contains('trainer_|jockey_|experience|logodds')]
         print("\nRefined Specialization Features:")
         print(spec_features.head(15))
+
+        # Fit temperature using OOF logits with GroupKFold on Race_ID to improve calibration
+        print("\nFitting temperature with GroupKFold OOF logits (race-level softmax)...")
+        self._fit_temperature_with_oof(
+            X=X,
+            y=y.values if isinstance(y, pd.Series) else y,
+            race_ids=train_df['Race_ID'].values
+        )
         
     def predict(self, test_df):
         """Generate predictions with moderate confidence"""
@@ -355,31 +355,130 @@ class RefinedCompliantModel:
         
         #Predicting
         X_test = test_df[self.feature_cols].fillna(0)
-        raw_probs = self.model.predict_proba(X_test)[:, 1]
-        
-        #NO additional calibration - letting model's natural calibration work
-        
-        #Creating output
+        raw_logits = self.model.predict(X_test, raw_score=True)
+
+        #Creating output frame with logits
         predictions = pd.DataFrame({
             'Race_ID': test_df['Race_ID'],
             'Horse': test_df['Horse'],
-            'raw_prob': raw_probs
+            'logit': raw_logits
         })
-        
-        #Normalizing by race
+
+        # Race-level softmax with learned temperature ensures sum-to-1 and better calibration
         final_predictions = []
         for race_id, race_data in predictions.groupby('Race_ID'):
-            race_probs = race_data['raw_prob'].values
-            normalized = race_probs / race_probs.sum()
-            
+            logits = race_data['logit'].values
+            probs = self._softmax(logits, temperature=self.temperature)
+
             for i, row in enumerate(race_data.itertuples()):
                 final_predictions.append({
                     'Race_ID': race_id,
                     'Horse': row.Horse,
-                    'Predicted_Probability': normalized[i]
+                    'Predicted_Probability': probs[i]
                 })
-        
+
         return pd.DataFrame(final_predictions)
+
+    def _create_base_model(self):
+        """Factory for base LightGBM model so we can reproduce it for OOF."""
+        return lgb.LGBMClassifier(
+            n_estimators=300,
+            learning_rate=0.025,  # Slightly lower
+            num_leaves=25,        # Fewer leaves
+            max_depth=5,          # Shallower
+            min_child_samples=30, # More samples required
+            subsample=0.7,        # More aggressive subsampling
+            colsample_bytree=0.7,
+            reg_alpha=0.2,        # Stronger L1
+            reg_lambda=0.2,       # Stronger L2
+            random_state=42,
+            verbose=-1
+        )
+
+    @staticmethod
+    def _softmax(logits, temperature=1.0):
+        """Numerically stable softmax with temperature."""
+        logits = np.asarray(logits, dtype=float)
+        t = max(1e-6, float(temperature))
+        scaled = logits / t
+        # stability
+        m = np.max(scaled)
+        exps = np.exp(scaled - m)
+        denom = exps.sum()
+        if denom <= 0:
+            # fallback to uniform
+            return np.ones_like(exps) / len(exps)
+        return exps / denom
+
+    def _fit_temperature_with_oof(self, X, y, race_ids):
+        """Fit temperature parameter T using OOF logits and race-level softmax NLL.
+
+        We use GroupKFold on Race_ID so that each validation fold contains entire races.
+        """
+        # Prepare containers
+        n_samples = X.shape[0]
+        oof_logits = np.full(n_samples, np.nan, dtype=float)
+
+        gkf = GroupKFold(n_splits=self.cv_folds)
+        for fold_idx, (tr_idx, va_idx) in enumerate(gkf.split(X, y, groups=race_ids), start=1):
+            model_fold = self._create_base_model()
+            model_fold.fit(X.iloc[tr_idx], y[tr_idx])
+            oof_logits[va_idx] = model_fold.predict(X.iloc[va_idx], raw_score=True)
+
+        # Safety: if any remain NaN, fill with in-sample logits from the trained model
+        if np.isnan(oof_logits).any():
+            fallback = self.model.predict(X, raw_score=True)
+            oof_logits = np.where(np.isnan(oof_logits), fallback, oof_logits)
+
+        # Grid search for temperature minimizing average per-race NLL
+        def nll_for_temperature(temp):
+            eps = 1e-15
+            total_nll = 0.0
+            races_count = 0
+            for rid in np.unique(race_ids):
+                idx = (race_ids == rid)
+                logits_r = oof_logits[idx]
+                y_r = y[idx]
+                if logits_r.size == 0:
+                    continue
+                p_r = self._softmax(logits_r, temperature=temp)
+                # Cross-entropy for one-hot (or multi-hot if rare ties)
+                y_sum = np.sum(y_r)
+                if y_sum <= 0:
+                    # skip races without a labeled winner in training
+                    continue
+                if y_sum == 1:
+                    # standard case: exactly one winner
+                    winner_prob = np.sum(p_r[y_r.astype(bool)])
+                    total_nll += -np.log(max(eps, winner_prob))
+                    races_count += 1
+                else:
+                    # rare case: multiple winners; use cross-entropy over multi-hot
+                    total_nll += -np.sum((y_r / y_sum) * np.log(np.clip(p_r, eps, 1.0)))
+                    races_count += 1
+            return total_nll / max(1, races_count)
+
+        candidate_ts = np.linspace(0.2, 5.0, 49)
+        best_t = None
+        best_obj = float('inf')
+        for t in candidate_ts:
+            val = nll_for_temperature(t)
+            if val < best_obj:
+                best_obj = val
+                best_t = t
+
+        # local refine around best
+        low = max(0.05, best_t * 0.5)
+        high = min(10.0, best_t * 1.5)
+        refine_ts = np.linspace(low, high, 41)
+        for t in refine_ts:
+            val = nll_for_temperature(t)
+            if val < best_obj:
+                best_obj = val
+                best_t = t
+
+        self.temperature = float(best_t)
+        print(f"Optimal temperature: {self.temperature:.4f} | OOF per-race NLL: {best_obj:.6f}")
 
 def main():
     """Main execution"""
