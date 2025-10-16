@@ -22,6 +22,7 @@ class RefinedCompliantModel:
         # Calibration parameters
         self.temperature = 1.0
         self.cv_folds = 5
+        self.mix_alpha = 0.0  # Uniform blend strength for Brier improvement
         
     def validate_no_leakage(self, df, stage=""):
         """Ensure no forbidden columns are used"""
@@ -270,14 +271,12 @@ class RefinedCompliantModel:
         df['prev_market_prob_2nd'] = 1 / (df['MarketOdds_2ndPreviousRun'] + 1)
         df['market_consistency'] = abs(df['prev_market_prob'] - df['prev_market_prob_2nd'])
         
-        #Age features
-        df['young_horse'] = (df['Age'] <= 3).astype(int)
-        df['prime_age'] = (df['Age'].between(4, 6)).astype(int)
-        df['veteran'] = (df['Age'] >= 7).astype(int)
+        #Age features (use race-relative stats, avoid arbitrary bins)
+        # Raw 'Age' will be included as-is; add race-relative percentile/zscore below
         
         #Race-relative features
         for col in ['Speed_PreviousRun', 'TrainerRating', 'JockeyRating', 
-                    'Prize', 'daysSinceLastRun', 'prev_market_prob']:
+                    'Prize', 'daysSinceLastRun', 'prev_market_prob', 'Age']:
             if col in df.columns:
                 df[f'{col}_percentile'] = df.groupby('Race_ID')[col].rank(pct=True)
                 df[f'{col}_zscore'] = df.groupby('Race_ID')[col].transform(
@@ -369,6 +368,9 @@ class RefinedCompliantModel:
         for race_id, race_data in predictions.groupby('Race_ID'):
             logits = race_data['logit'].values
             probs = self._softmax(logits, temperature=self.temperature)
+            if self.mix_alpha > 0:
+                k = len(probs)
+                probs = (1.0 - self.mix_alpha) * probs + self.mix_alpha * (np.ones_like(probs) / k)
 
             for i, row in enumerate(race_data.itertuples()):
                 final_predictions.append({
@@ -479,6 +481,37 @@ class RefinedCompliantModel:
 
         self.temperature = float(best_t)
         print(f"Optimal temperature: {self.temperature:.4f} | OOF per-race NLL: {best_obj:.6f}")
+
+        # With T fixed, choose a small uniform blend to reduce Brier score
+        def brier_for_alpha(alpha):
+            total_brier = 0.0
+            total_items = 0
+            for rid in np.unique(race_ids):
+                idx = (race_ids == rid)
+                logits_r = oof_logits[idx]
+                y_r = y[idx]
+                if logits_r.size == 0:
+                    continue
+                p_r = self._softmax(logits_r, temperature=self.temperature)
+                k = len(p_r)
+                if alpha > 0:
+                    p_r = (1.0 - alpha) * p_r + alpha * (np.ones_like(p_r) / k)
+                # Brier for multi-class one-vs-all labels
+                total_brier += np.sum((p_r - y_r)**2)
+                total_items += k
+            return total_brier / max(1, total_items)
+
+        alphas = np.linspace(0.0, 0.2, 11)
+        best_alpha = 0.0
+        best_brier = float('inf')
+        for a in alphas:
+            b = brier_for_alpha(a)
+            if b < best_brier:
+                best_brier = b
+                best_alpha = a
+
+        self.mix_alpha = float(best_alpha)
+        print(f"Optimal uniform blend alpha: {self.mix_alpha:.4f} | OOF Brier: {best_brier:.6f}")
 
 def main():
     """Main execution"""
